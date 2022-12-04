@@ -3577,6 +3577,9 @@
     (path "/b69ec0e2-88cb-4219-a8a7-8e951a005a2f"
       (reference "#PWR0152") (unit 1) (value "GND") (footprint "")
     )
+    (path "/ddd80574-53d7-4a63-bef6-38175cdddf88/235f4958-bc9c-47f0-b4fe-0723ad70d228"
+      (reference "#PWR0153") (unit 1) (value "+3.3V") (footprint "")
+    )
     (path "/93c82e43-9609-49fb-8937-c1aa68c35376"
       (reference "BT1") (unit 1) (value "Battery_Cell") (footprint "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical")
     )
@@ -3762,6 +3765,12 @@
     )
     (path "/aaa550df-2f96-474b-868c-1f362c100659"
       (reference "R18") (unit 1) (value "2.2k") (footprint "Resistor_SMD:R_0603_1608Metric")
+    )
+    (path "/ddd80574-53d7-4a63-bef6-38175cdddf88/67168e96-1026-4adf-b375-36261352f76d"
+      (reference "R19") (unit 1) (value "4k7") (footprint "Resistor_SMD:R_0603_1608Metric")
+    )
+    (path "/ddd80574-53d7-4a63-bef6-38175cdddf88/5d0a1c14-462c-4ff2-b53d-8f9b97622821"
+      (reference "R20") (unit 1) (value "4k7") (footprint "Resistor_SMD:R_0603_1608Metric")
     )
     (path "/8331e565-c204-490e-a2e6-ec72101a197c"
       (reference "SW1") (unit 1) (value "SW_SPST") (footprint "Connector_PinSocket_2.54mm:PinSocket_1x02_P2.54mm_Vertical")
