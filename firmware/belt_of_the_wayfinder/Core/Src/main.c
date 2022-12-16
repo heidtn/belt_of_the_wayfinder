@@ -29,6 +29,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "i2c.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -52,13 +57,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-ADC_HandleTypeDef hadc;
-
-I2C_HandleTypeDef hi2c2;
-
-TIM_HandleTypeDef htim16;
-
-UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
@@ -73,35 +71,63 @@ typedef struct __attribute__((packed)) {
 	int16_t X;
 	int16_t Y;
 	int16_t Z;
-} gyrometer_reading_t;
+} magnetometer_reading_t;
 
-#define IMU_I2C_ID 0x4C
+typedef enum {
+	SINGLE_BLINK,
+	DOUBLE_BLINK,
+} blink_type_t;
 
 // register definitions
-#define IMU_CTRL1_REG 0x1B
-#define IMU_OUTPUT_X_REG 0x10
+#define MAG_I2C_ID (0x1E << 1)
+#define MAG_REG_CFG_A (0x60)
+#define MAG_REG_CFG_C (0x62)
+#define MAG_REG_OFFSETX_L (0x45)
+#define MAG_REG_OUTX_L (0x68)
 
-// default register values
-#define IMU_CTRL1_ACTIVE 0x8A
+#define IMU_I2C_ID (0x6A << 1)
+#define IMU_REG_WHOAMI (0x0F)
+#define IMU_REG_MD1_CFG (0x5E)
+#define IMU_REG_TAP_CFG (0x58)
+#define IMU_REG_CTRL1_XL (0x10)
+#define IMU_REG_TAPSRC (0x1C)
+#define IMU_REG_FUNC_CFG_ACCESS (0x01)
+#define IMU_REG_FIFO_CTRL5 (0x0A)
+
+#define IMU_MD1_CFG (0b00001000)
+#define IMU_TAP_CFG (0b10001111)  // TODO remove last bit as latch
+#define IMU_CTRL1_XL (0b01000000)
+#define IMU_FUNC_CFG_ACCESS (0b10100000)
+#define IMU_FIFO_CTRL5 (0b00100110)
+
+static magnetometer_reading_t mag_offset = {
+	.X = -136,
+	.Y = -352,
+	.Z = -216
+};
 
 GPIO_TypeDef* motor_ports[] = {GPIOB, GPIOB, GPIOB, GPIOB, GPIOA, GPIOA, GPIOA, GPIOA};
 uint16_t motor_pins[] = {GPIO_PIN_12, GPIO_PIN_13, GPIO_PIN_14, GPIO_PIN_15, GPIO_PIN_4, GPIO_PIN_5, GPIO_PIN_6, GPIO_PIN_7};
 unsigned int target_buzzer = 0;
 
+#define LED_PORT GPIOB
+#define LED_PIN GPIO_PIN_0
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_ADC_Init(void);
-static void MX_I2C2_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
 
-static void init_mc6470(void);
+static void init_mag(void);
+static void init_imu(void);
 static void get_compass_direction(compass_vector_t *direction);
 static void set_buzzers(compass_vector_t *direction);
+static void error_blink(blink_type_t blink_type);
+static void set_mag_offset(void);
+static void motor_test(void);
+static void configure_charger(void);
+static void configure_motors(void);
 
 /* USER CODE END PFP */
 
@@ -133,6 +159,12 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+/*
+  HAL_NVIC_DisableIRQ(SysTick_IRQn);
+  HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
+  HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
+  HAL_NVIC_EnableIRQ(SysTick_IRQn);
+*/
 
   /* USER CODE END SysInit */
 
@@ -153,16 +185,22 @@ int main(void)
   // may need to set NVIC enable on the IRQ for the timer: https://electronics.stackexchange.com/questions/544797/output-compares-triggering-function-not-work-on-stm32
 
   compass_vector_t direction;
-  init_mc6470();
+  init_mag();
+  set_mag_offset();
+  init_imu();
+  configure_motors();
+  configure_charger();
+  //motor_test();
+
   HAL_TIM_Base_Start_IT(&htim16);
+
 
   while (1)
   {
-
-	init_mc6470();
 	get_compass_direction(&direction);
-	set_buzzers(&direction);
-	HAL_Delay(20);
+	configure_motors();
+	//set_buzzers(&direction);
+	HAL_Delay(500);
 
     /* USER CODE END WHILE */
 
@@ -191,7 +229,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSI14CalibrationValue = 16;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL2;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
   RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -205,284 +243,92 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1;
-  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK1;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_HSI;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
-/**
-  * @brief ADC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC_Init(void)
-{
-
-  /* USER CODE BEGIN ADC_Init 0 */
-
-  /* USER CODE END ADC_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC_Init 1 */
-
-  /* USER CODE END ADC_Init 1 */
-  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-  */
-  hadc.Instance = ADC1;
-  hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
-  hadc.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc.Init.ScanConvMode = ADC_SCAN_DIRECTION_FORWARD;
-  hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  hadc.Init.LowPowerAutoWait = DISABLE;
-  hadc.Init.LowPowerAutoPowerOff = DISABLE;
-  hadc.Init.ContinuousConvMode = DISABLE;
-  hadc.Init.DiscontinuousConvMode = DISABLE;
-  hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc.Init.DMAContinuousRequests = DISABLE;
-  hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  if (HAL_ADC_Init(&hadc) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /** Configure for the selected ADC regular channel to be converted.
-  */
-  sConfig.Channel = ADC_CHANNEL_2;
-  sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
-  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC_Init 2 */
-
-  /* USER CODE END ADC_Init 2 */
-
-}
-
-/**
-  * @brief I2C2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2C2_Init(void)
-{
-
-  /* USER CODE BEGIN I2C2_Init 0 */
-
-  /* USER CODE END I2C2_Init 0 */
-
-  /* USER CODE BEGIN I2C2_Init 1 */
-
-  /* USER CODE END I2C2_Init 1 */
-  hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = 0x00303D5B;
-  hi2c2.Init.OwnAddress1 = 0;
-  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c2.Init.OwnAddress2 = 0;
-  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /** Configure Analogue filter
-  */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /** Configure Digital filter
-  */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C2_Init 2 */
-
-  /* USER CODE END I2C2_Init 2 */
-
-}
-
-/**
-  * @brief TIM16 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM16_Init(void)
-{
-
-  /* USER CODE BEGIN TIM16_Init 0 */
-
-  /* USER CODE END TIM16_Init 0 */
-
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM16_Init 1 */
-
-  /* USER CODE END TIM16_Init 1 */
-  htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 1-1;
-  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 2400-1;
-  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim16.Init.RepetitionCounter = 0;
-  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_OC_Init(&htim16) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 1200;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_OC_ConfigChannel(&htim16, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim16, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM16_Init 2 */
-
-  /* USER CODE END TIM16_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
-                          |GPIO_PIN_15|GPIO_PIN_9, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PA0 PA1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PA4 PA5 PA6 PA7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB0 PB12 PB13 PB14
-                           PB15 PB9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
-                          |GPIO_PIN_15|GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
-
-}
-
 /* USER CODE BEGIN 4 */
 
+static void init_mag(void) {
+	// nominal startup, consult the datasheet
+	uint8_t cfga_nominal[] = {0x80};
+	uint8_t cfgc_nominal[] = {0x01};
 
-static void init_mc6470(void) {
-	uint8_t initialization[] = {IMU_CTRL1_REG, IMU_CTRL1_ACTIVE};
-	HAL_I2C_Master_Transmit(&hi2c2, IMU_I2C_ID, initialization, sizeof(initialization), HAL_MAX_DELAY);
+	HAL_StatusTypeDef stat_a = HAL_I2C_Mem_Write(&hi2c2, MAG_I2C_ID, MAG_REG_CFG_A, 1, cfga_nominal, sizeof(cfga_nominal), 1000);
+	HAL_StatusTypeDef stat_c = HAL_I2C_Mem_Write(&hi2c2, MAG_I2C_ID, MAG_REG_CFG_C, 1, cfgc_nominal, sizeof(cfga_nominal), 1000);
+
+	if(stat_a != HAL_OK || stat_c != HAL_OK) {
+		error_blink(DOUBLE_BLINK);
+	}
+}
+
+static void set_mag_offset(void) {
+	HAL_StatusTypeDef stat_a = HAL_I2C_Mem_Write(&hi2c2, MAG_I2C_ID, MAG_REG_OFFSETX_L, 1, &mag_offset, sizeof(mag_offset), 1000);
+}
+
+static HAL_StatusTypeDef imu_write_reg(uint8_t reg, uint8_t value) {
+	uint8_t val[] = {value};
+	HAL_StatusTypeDef stat = HAL_I2C_Mem_Read(&hi2c2, IMU_I2C_ID, reg, 1, val, sizeof(val), 1000);
+	return stat;
+}
+
+static void init_imu(void) {
+	uint8_t ID[] = {0x00};
+	HAL_StatusTypeDef stat = HAL_I2C_Mem_Read(&hi2c2, IMU_I2C_ID, IMU_REG_WHOAMI, 1, ID, sizeof(ID), 1000);
+
+	HAL_StatusTypeDef stat_md1 = imu_write_reg(IMU_REG_MD1_CFG, IMU_MD1_CFG);
+	HAL_StatusTypeDef stat_tap = imu_write_reg(IMU_REG_TAP_CFG, IMU_TAP_CFG);
+	HAL_StatusTypeDef stat_nom = imu_write_reg(IMU_REG_CTRL1_XL, IMU_CTRL1_XL);
+	HAL_StatusTypeDef stat_fifo = imu_write_reg(IMU_REG_FIFO_CTRL5, IMU_FIFO_CTRL5);
+
+	if((stat | stat_md1 | stat_tap | stat_nom ) != HAL_OK) {
+		error_blink(DOUBLE_BLINK);
+	}
+}
+
+static void error_blink(blink_type_t blink_type) {
+	switch(blink_type) {
+		case DOUBLE_BLINK:
+			HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
+			HAL_Delay(250);
+			HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
+			HAL_Delay(250);
+			HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
+			HAL_Delay(250);
+			HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
+			break;
+		default:
+			break;
+	}
 }
 
 static void get_compass_direction(compass_vector_t *direction) {
-	static gyrometer_reading_t reading;
-	uint8_t read_request[] = {IMU_OUTPUT_X_REG};
-	HAL_I2C_Master_Transmit(&hi2c2, IMU_I2C_ID, read_request, sizeof(read_request), HAL_MAX_DELAY);
-	HAL_I2C_Master_Receive(&hi2c2, IMU_I2C_ID, (uint8_t *)&reading, sizeof(reading), HAL_MAX_DELAY);
+	static magnetometer_reading_t reading;
+	HAL_I2C_Mem_Read(&hi2c2, MAG_I2C_ID, MAG_REG_OUTX_L, 1, (uint8_t *)&reading, sizeof(reading), HAL_MAX_DELAY);
 
 	// lazy change of coordinate frames, probably wrong
-	direction->x = (float)reading.Y / (float)INT16_MAX;
-	direction->y = (float)reading.Z / (float)INT16_MAX;
+	direction->x = (float)reading.X;
+	direction->y = (float)reading.Z;
 	float x = direction->x;
 	float y = direction->y;
 
 	// bad cohesion!  Probably break this stuff out into vector management functions
 	float length = sqrt(x*x + y*y);
-	direction->x /= length;
-	direction->y /= length;
+	if(abs(length) < 0.001) {
+		direction->y = 1.0;
+		direction->x = 0.0;
+	} else {
+		direction->x /= length;
+		direction->y /= length;
+	}
 
 	static char message[64];
 	int string_length = sprintf(message, "Got new reading: %f %f\n", direction->x, direction->y);
@@ -513,16 +359,43 @@ static void set_buzzers(compass_vector_t *direction) {
 	HAL_UART_Transmit(&huart1, message, string_length, HAL_MAX_DELAY);
 }
 
+static void motor_test(void) {
+	int num_motors = sizeof(motor_ports) / sizeof(motor_ports[0]);
+	for(int i = 0; i < num_motors; i++) {
+		HAL_GPIO_WritePin(motor_ports[i], motor_pins[i], GPIO_PIN_SET);
+		HAL_Delay(100);
+		HAL_GPIO_WritePin(motor_ports[i], motor_pins[i], GPIO_PIN_RESET);
+		HAL_Delay(100);
+	}
+}
+
+static void configure_motors(void) {
+	int num_motors = sizeof(motor_ports) / sizeof(motor_ports[0]);
+	for(int i = 0; i < num_motors; i++) {
+		//HAL_GPIO_WritePin(motor_ports[i], motor_pins[i], GPIO);
+		HAL_GPIO_TogglePin(motor_ports[i], motor_pins[i]);
+	}
+}
+
+static void configure_charger(void) {
+	HAL_GPIO_WritePin(SHDN_GPIO_Port, SHDN_Pin, GPIO_PIN_SET);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	if(htim == &htim16) {
-		HAL_GPIO_WritePin(motor_ports[target_buzzer], motor_pins[target_buzzer], GPIO_PIN_SET);
+
+		//HAL_GPIO_WritePin(motor_ports[target_buzzer], motor_pins[target_buzzer], GPIO_PIN_SET);
 	}
 }
 
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
 	if(htim == &htim16) {
-		HAL_GPIO_WritePin(motor_ports[target_buzzer], motor_pins[target_buzzer], GPIO_PIN_RESET);
+		//HAL_GPIO_WritePin(motor_ports[target_buzzer], motor_pins[target_buzzer], GPIO_PIN_RESET);
 	}
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	//HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 }
 
 /* USER CODE END 4 */
